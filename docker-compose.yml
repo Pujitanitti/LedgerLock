@@ -1,0 +1,60 @@
+name: ledger-lock
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledger-lock-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ledgerlock}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_only_password_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-ledgerlock}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - ledger-lock-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-ledgerlock} -d ${POSTGRES_DB:-ledgerlock}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ledger-lock-redis
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'no']
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # The API service is intentionally NOT started by default in local dev —
+  # most contributors will run `npm run dev` on the host against these two
+  # containers for fast reload. Enable with: docker compose --profile full up
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: ledger-lock-api
+    restart: unless-stopped
+    profiles: ['full']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ledgerlock}:${POSTGRES_PASSWORD:-dev_only_password_change_me}@postgres:5432/${POSTGRES_DB:-ledgerlock}?schema=public
+      REDIS_URL: redis://redis:6379
+      API_KEY_HMAC_PEPPER: ${API_KEY_HMAC_PEPPER:-dev_only_pepper_change_me_before_any_shared_use}
+    ports:
+      - '3000:3000'
+
+volumes:
+  ledger-lock-postgres-data:

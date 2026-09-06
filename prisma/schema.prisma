@@ -1,0 +1,298 @@
+// Ledger-Lock database schema.
+// See docs/decisions/ADR-002 (Postgres as source of truth) and
+// ADR-004 (policy/version-based cache invalidation) for the reasoning
+// behind the fields below — especially the dual authzVersion counters.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id           String   @id @default(cuid())
+  slug         String   @unique
+  name         String
+  // Bumped on any structural authorization change for this tenant:
+  // role/permission definitions, role inheritance edges, policies.
+  // Included in every Redis decision-cache key for this tenant.
+  authzVersion Int      @default(1)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  users       User[]
+  roles       Role[]
+  permissions Permission[]
+  policies    Policy[]
+  apiKeys     ApiKey[]
+  auditLogs   AuditLog[]
+
+  @@map("tenants")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  // The identifier the client application uses for this user (its own PK/UUID).
+  externalId   String
+  // Bumped only when THIS user's role assignments change. Keeps cache
+  // invalidation scoped to the affected user instead of the whole tenant.
+  authzVersion Int      @default(1)
+  // Arbitrary ABAC attributes, e.g. { "department": "finance" }.
+  attributes   Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  roles  UserRole[]
+
+  @@unique([tenantId, externalId])
+  @@index([tenantId])
+  @@map("users")
+}
+
+model Role {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  users       UserRole[]
+
+  // This role inherits permissions FROM these parents (e.g. Owner's parent is Admin).
+  parentEdges RoleInheritance[] @relation("ChildRole")
+  // These children inherit permissions FROM this role.
+  childEdges  RoleInheritance[] @relation("ParentRole")
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+// A directed edge in the role DAG: childRole inherits everything parentRole grants.
+// Cycle prevention is enforced at write time (advisory lock + CTE check),
+// not by a database constraint — see ADR and RoleHierarchyService.
+model RoleInheritance {
+  id           String @id @default(cuid())
+  tenantId     String
+  parentRoleId String
+  childRoleId  String
+
+  parent Role @relation("ParentRole", fields: [parentRoleId], references: [id], onDelete: Cascade)
+  child  Role @relation("ChildRole", fields: [childRoleId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, parentRoleId, childRoleId])
+  @@index([tenantId, childRoleId])
+  @@index([tenantId, parentRoleId])
+  @@map("role_inheritance")
+}
+
+model Permission {
+  id        String   @id @default(cuid())
+  tenantId  String
+  // "resource:action" format, e.g. "invoice:delete".
+  action    String
+  createdAt DateTime @default(now())
+
+  tenant Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  roles  RolePermission[]
+
+  @@unique([tenantId, action])
+  @@index([tenantId])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String
+  roleId String
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+// Declarative ABAC policy. `conditions` is validated by a Zod schema in the
+// application layer before it is ever written here — see
+// authorization/policy-engine. Never interpreted as code.
+// Declarative ABAC policy — split into Policy (stable identity/metadata)
+// and PolicyVersion (immutable content) so an update can never overwrite
+// the historical record of what a past decision was actually evaluated
+// against. See docs/decisions/ADR-011-policy-versioning.md.
+//
+// The original single-row design (identity and content in one row, with
+// a mutable `version` counter) was replaced here, before Phase 5 wrote
+// any application code against it, specifically because it made
+// immutable versioning impossible: "updating" it would have meant either
+// overwriting history in place (violating the explicit versioning
+// requirement) or minting a new Policy id per edit (breaking the concept
+// of "the same policy, revised"). Splitting identity from content
+// resolves this without either compromise.
+model Policy {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant   Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  versions PolicyVersion[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, enabled])
+  @@map("policies")
+}
+
+// Immutable once created — there is deliberately no update/patch method
+// anywhere in the codebase for this model (see PolicyRepositoryPort).
+// The "current" version for a policy is simply the row with the highest
+// `version` number for that policyId — not a separate stored pointer —
+// which avoids a circular-FK bootstrapping problem (Policy pointing at
+// PolicyVersion, which points back at Policy) for a property that a
+// simple MAX(version) query already gives deterministically and cheaply
+// given the (tenantId, policyId, version) index below.
+model PolicyVersion {
+  id       String @id @default(cuid())
+  policyId String
+  // Denormalized from Policy.tenantId: lets every policy-evaluation
+  // query filter by tenantId directly on this table (defense in depth —
+  // see ADR-007) without an extra join, and makes cross-tenant access
+  // structurally impossible to express by accident in a query here.
+  tenantId String
+  version  Int
+
+  effect String // "allow" | "deny"
+
+  // resource:action patterns this version applies to. "*" matches any
+  // action. See authorization/policy-engine/policy-matching.ts.
+  actions String[]
+
+  // Resource type patterns this version applies to. "*" matches any
+  // resource type, and is required for a policy to apply to a check
+  // that specifies no resource at all.
+  resourceTypes String[]
+
+  // Array of Condition objects (field/operator/value). Validated by
+  // authorization/conditions/condition-validator.ts BEFORE this row is
+  // ever created — never interpreted as code. See ADR-009.
+  conditions Json
+
+  // Tiebreaker for deterministic provenance reporting ONLY when multiple
+  // policies of the SAME effect match — it does NOT let a lower-priority
+  // ALLOW override a DENY; deny dominance is unconditional regardless of
+  // priority. See ADR-010.
+  priority Int @default(0)
+
+  createdAt DateTime @default(now())
+
+  policy Policy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([policyId, version])
+  @@index([tenantId, policyId, version])
+  @@map("policy_versions")
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  tenantId   String
+  // Public, non-secret lookup identifier — the "<publicId>" segment of
+  // ll_live_<publicId>_<secret>. Safe to index and log.
+  publicId   String    @unique
+  // HMAC-SHA256(pepper, secret) — never the raw secret. See ADR-006.
+  secretHash String
+  name       String
+  revokedAt  DateTime?
+  expiresAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+// Append-only. No update/delete API is ever exposed for this table
+// (tamper-resistance — see threat model, "audit tampering").
+//
+// Phase 6 extension: resourceType/resourceId are now nullable (a check
+// can legitimately have no resource at all — see
+// authorization/decision-engine/types.ts). policyId/matchedPolicies
+// capture ABAC provenance (Phase 5 introduced multiple candidate
+// policies; a single decision may have zero, one, or several matches).
+// sourceOutboxId is the idempotency key linking this row back to the
+// AuditOutbox row that produced it — see AuditOutboxProcessorService,
+// which upserts by this field so a retried/duplicated processing
+// attempt can never create two AuditLog rows for the same decision.
+model AuditLog {
+  id            String   @id @default(cuid())
+  tenantId      String
+  userId        String
+  action        String
+  resourceType  String?
+  resourceId    String?
+  decision      String // "allow" | "deny"
+  reason        String
+  policyVersion Int?
+  policyId      String?
+  matchedPolicies Json?
+  servedFromCache Boolean  @default(false)
+  sourceOutboxId  String?  @unique
+  latencyMs     Float
+  requestId     String
+  createdAt     DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, decision, createdAt])
+  @@map("audit_logs")
+}
+
+// Durable outbox for audit events so the authorization decision path never
+// blocks on (or is slowed by) the AuditLog write. A background worker drains
+// this table and moves rows into AuditLog, retrying on failure.
+// See ADR-012 for the full processing/retry/dead-letter design.
+//
+// Phase 6 extension: nextAttemptAt implements backoff without a
+// scheduler dependency — the processor itself computes and stores when
+// a failed row becomes eligible for another attempt; claimBatch only
+// ever selects rows whose time has come. deadLetteredAt marks a row that
+// exceeded the max retry count — it is left in the table (never
+// deleted, for operator visibility) but permanently excluded from
+// claimBatch.
+model AuditOutbox {
+  id            String    @id @default(cuid())
+  payload       Json
+  attempts      Int       @default(0)
+  lastError     String?
+  processedAt   DateTime?
+  nextAttemptAt DateTime  @default(now())
+  deadLetteredAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([processedAt, deadLetteredAt, nextAttemptAt])
+  @@map("audit_outbox")
+}
