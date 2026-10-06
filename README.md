@@ -48,7 +48,7 @@ Implemented:
 
 ## Architecture Overview
 
-```mermaid
+
 flowchart TD
     A[Client with per-tenant API key] --> B[Authentication]
     B --> C[Tenant Resolution]
@@ -66,7 +66,7 @@ flowchart TD
     L --> M[(AuditOutbox)]
     M --> N[AuditOutboxProcessor: retry/backoff/dead-letter, idempotent]
     N --> O[(AuditLog)]
-```
+
 
 Text equivalent, for anything that doesn't render Mermaid:
 
